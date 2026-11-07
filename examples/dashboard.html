@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18650-4CHN monitor</title>
+<style>
+  :root {
+    --bg: #111418;
+    --panel: #1a1f25;
+    --line: #2a3139;
+    --text: #e6e9ec;
+    --muted: #8b949e;
+    --charge: #3fb950;
+    --discharge: #f0883e;
+    --stop: #8b949e;
+    --warn: #d29922;
+    --bad: #f85149;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); }
+  header { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: baseline; padding: 16px 24px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 13px; }
+  #status { font-size: 13px; padding: 2px 8px; border-radius: 4px; background: var(--line); }
+  #status.connected { background: #1f3d2a; color: var(--charge); }
+  #status.problem { background: #3d1f1f; color: var(--bad); }
+  #banner { display: none; padding: 10px 24px; background: #3d2f12; color: var(--warn); font-weight: 600; }
+  #banner.visible { display: block; }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; padding: 24px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
+  .card.absent { opacity: 0.45; }
+  .card.stale { border-color: var(--warn); }
+  .top { display: flex; justify-content: space-between; align-items: baseline; }
+  .name { font-size: 15px; font-weight: 600; }
+  .state { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .state.charge { color: var(--charge); }
+  .state.discharge { color: var(--discharge); }
+  .state.stop, .state.unknown { color: var(--stop); }
+  .voltage { font-size: 40px; margin: 12px 0 2px; }
+  .voltage small { font-size: 16px; color: var(--muted); }
+  .hint { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; text-align: right; }
+  .issues { margin-top: 10px; color: var(--warn); font-size: 12px; min-height: 1em; }
+  footer { padding: 0 24px 24px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>18650-4CHN monitor</h1>
+  <span id="status">connecting</span>
+  <span class="meta" id="source">-</span>
+  <span class="meta" id="snapshot">-</span>
+</header>
+<div id="banner">SIMULATED DATA: the values below are synthetic, not measurements.</div>
+<main id="channels"></main>
+<footer>
+  V: battery voltage from the ADC buffer (experimental scale, not calibrated). V display: value cached by the device for its screen, refreshed only for the selected slot.<br>
+  I~: estimated from the capacity counter, not a direct measurement. Read-only view of <code>chn4-bridge serve</code>; the URL can be changed with <code>?url=ws://host:port</code>.
+</footer>
+<script>
+  const params = new URLSearchParams(location.search);
+  const url = params.get("url") || "ws://127.0.0.1:8765";
+  const SUPPORTED_SCHEMA = 1;
+  const statusEl = document.getElementById("status");
+  const sourceEl = document.getElementById("source");
+  const snapshotEl = document.getElementById("snapshot");
+  const bannerEl = document.getElementById("banner");
+  const container = document.getElementById("channels");
+  const cards = new Map();
+  let retryDelay = 1000;
+
+  const fields = [
+    ["display_voltage_v", "V display", (v) => fmt(v, 3, "V")],
+    ["current_recent_a", "I~ recent", (v) => fmt(v, 3, "A")],
+    ["current_average_a", "I~ average", (v) => fmt(v, 3, "A")],
+    ["capacity_mah", "Capacity", (v) => fmt(v, 1, "mAh")],
+    ["energy_mwh", "Energy", (v) => fmt(v, 1, "mWh")],
+    ["elapsed_s", "Elapsed", duration],
+    ["resistance_raw_mohm", "R raw", (v) => fmt(v, 0, "mOhm")],
+    ["resistance_compensated_mohm", "R compensated", (v) => fmt(v, 0, "mOhm")],
+    ["activity", "Activity", (v) => v],
+  ];
+
+  function fmt(value, digits, unit) {
+    return value === null || value === undefined ? "n/a" : `${value.toFixed(digits)} ${unit}`;
+  }
+
+  function duration(seconds) {
+    if (seconds === null || seconds === undefined) return "n/a";
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind || "";
+  }
+
+  function card(number) {
+    if (cards.has(number)) return cards.get(number);
+    const root = document.createElement("section");
+    root.className = "card";
+    root.innerHTML = `
+      <div class="top"><span class="name">CH${number}</span><span class="state"></span></div>
+      <div class="voltage"></div>
+      <div class="hint">V (ADC, experimental)</div>
+      <dl></dl>
+      <div class="issues"></div>`;
+    const list = root.querySelector("dl");
+    const values = {};
+    for (const [key, label] of fields) {
+      const dt = document.createElement("dt");
+      dt.textContent = label;
+      const dd = document.createElement("dd");
+      list.append(dt, dd);
+      values[key] = dd;
+    }
+    container.append(root);
+    const entry = { root, state: root.querySelector(".state"), voltage: root.querySelector(".voltage"), issues: root.querySelector(".issues"), values };
+    cards.set(number, entry);
+    return entry;
+  }
+
+  function render(snapshot) {
+    const age = snapshot.age_s === undefined ? "" : `, age ${snapshot.age_s.toFixed(1)} s`;
+    snapshotEl.textContent = `#${snapshot.sequence} ${snapshot.captured_at} ${snapshot.consistency}${age}${snapshot.stale ? " STALE" : ""}`;
+    bannerEl.classList.toggle("visible", snapshot.simulated);
+    for (const channel of snapshot.channels) {
+      const entry = card(channel.channel);
+      entry.root.classList.toggle("absent", !channel.present);
+      entry.root.classList.toggle("stale", Boolean(snapshot.stale));
+      entry.state.textContent = channel.present ? `${channel.state} (${channel.state_code})` : "empty";
+      entry.state.className = `state ${channel.present ? channel.state : "unknown"}`;
+      entry.voltage.innerHTML = channel.voltage_v === null ? "n/a" : `${channel.voltage_v.toFixed(3)} <small>V</small>`;
+      for (const [key, , format] of fields) entry.values[key].textContent = format(channel[key]);
+      entry.issues.textContent = channel.issues.join(", ");
+    }
+  }
+
+  function connect() {
+    setStatus("connecting");
+    const socket = new WebSocket(url);
+    socket.addEventListener("open", () => { retryDelay = 1000; });
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      const data = message.data;
+      if (message.type === "hello") {
+        if (data.schema_version !== SUPPORTED_SCHEMA) {
+          setStatus(`unsupported schema ${data.schema_version}`, "problem");
+          socket.close();
+          return;
+        }
+        sourceEl.textContent = `${data.source.kind}: ${data.source.description} (server ${data.server_version})`;
+        bannerEl.classList.toggle("visible", data.source.simulated);
+      } else if (message.type === "probe_status") {
+        setStatus(data.state + (data.message ? `: ${data.message}` : ""), data.state === "connected" ? "connected" : "problem");
+      } else if (message.type === "snapshot") {
+        render(data);
+      } else if (message.type === "error" && data.fatal) {
+        setStatus(`${data.code}: ${data.message}`, "problem");
+      } else if (message.type === "shutdown") {
+        setStatus(`server stopped (${data.reason})`, "problem");
+      }
+    });
+    socket.addEventListener("close", () => {
+      setStatus(`disconnected, retrying in ${Math.round(retryDelay / 1000)} s`, "problem");
+      setTimeout(connect, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 15000);
+    });
+  }
+
+  connect();
+</script>
+</body>
+</html>
